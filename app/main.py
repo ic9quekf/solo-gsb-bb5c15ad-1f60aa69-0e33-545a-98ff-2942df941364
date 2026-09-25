@@ -15,7 +15,7 @@
   GET    /sessions/{id}/download        会话下载（原有接口，不计数；支持单 Range 断点续传：206/416）
   POST   /sessions/{id}/integrity-check 成品完整性巡检：流式核对长度与 SHA-256，异常即隔离
   POST   /sessions/{id}/tickets         签发受控下载票据（有效期 + 次数上限）
-  GET    /tickets/{ticket}/download     凭票下载（有效范围原子扣减一次，支持 Range；非法范围/隔离不扣次）
+  GET    /tickets/{ticket}/download     凭票下载（取得可读成品且 Range 有效后原子扣减一次；416/隔离/成品消失不扣次，支持 Range）
   POST   /tickets/{ticket}/revoke       撤销票据
   GET    /storage/summary              运维只读：按四种状态汇总会话与字节数
 """
@@ -1552,32 +1552,54 @@ def download_session(
     session_id: str,
     request: Request,
 ) -> Response:
-    conn = db.get_conn()
-    row = conn.execute(
-        "SELECT filename FROM upload_sessions WHERE id = ? AND status = 'completed'",
-        (session_id,),
-    ).fetchone()
-    if row is None:
-        raise _http(404, "no completed artifact for this session")
-    # 隔离会话拒绝下载：成品未通过完整性巡检，不得再对外分发。
-    # 标记优先于成品存在性判定：无论文件是否还在，隔离都是拒绝的权威原因。
-    mark = integrity.get_mark(conn, session_id)
-    if mark is not None:
-        raise _http(
-            423,
-            "session quarantined",
-            reason=mark["reason"],
-            quarantined_at=mark["created_at"],
-        )
-    path = storage.artifact_path(session_id)
-    if not path.is_file():
-        raise _http(404, "no completed artifact for this session")
-    # 断点下载：无 Range 返回完整文件（200）；单个合法 Range 返回 206，
-    # 多范围/越界返回 416（不读文件内容）。本接口不计数。
-    return ranges.build_download_response(
-        path,
+    # 与删除会话（DELETE）按同一会话锁串行，两种结局泾渭分明：
+    #   * 删除先完成：本请求在锁内看到非 completed/成品缺失，按现有
+    #     “无成品”语义 404（带非法 Range 时仍是对应 416）；
+    #   * 本请求先取得成品：锁内打开句柄并确定状态码/Range/长度，随后
+    #     释放锁流式发送；即使删除排队完成并移走目录项，已打开 inode
+    #     仍按声明的 Content-Length 送完全部字节。
+    with session_locks.get(session_id):
+        conn = db.get_conn()
+        row = conn.execute(
+            "SELECT filename FROM upload_sessions "
+            "WHERE id = ? AND status = 'completed'",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            raise _http(404, "no completed artifact for this session")
+        # 隔离会话拒绝下载：成品未通过完整性巡检，不得再对外分发。
+        # 标记优先于成品存在性判定：无论文件是否还在，隔离都是拒绝的权威原因。
+        mark = integrity.get_mark(conn, session_id)
+        if mark is not None:
+            raise _http(
+                423,
+                "session quarantined",
+                reason=mark["reason"],
+                quarantined_at=mark["created_at"],
+            )
+        path = storage.artifact_path(session_id)
+        try:
+            stat_size = path.stat().st_size
+        except FileNotFoundError:
+            raise _http(404, "no completed artifact for this session")
+        # 416 预检只取路径长度做判定，不打开文件、不读内容（保持成品
+        # 不可读时仅凭 stat 仍可 416 的语义）；合法 Range 放行。
+        raw_range = request.headers.get("range")
+        ranges.parse_range_header(raw_range, stat_size)
+        # 打开句柄固定这一份成品：长度改由句柄 fstat 取得，状态码、Range
+        # 与 Content-Length 随后都基于这同一份已打开对象确定。会话锁内
+        # DELETE 无法插入（外部直接移走文件属运维异常，按无成品 404 兜底）。
+        try:
+            handle, total_size = storage.open_artifact(session_id)
+        except OSError:
+            raise _http(404, "no completed artifact for this session")
+
+    # 会话锁已释放：句柄是之后唯一的读取来源，删除会话不再影响发送。
+    return ranges.build_pinned_response(
+        handle,
+        total_size,
         storage.safe_filename(row["filename"]),
-        request.headers.get("range"),
+        raw_range,
     )
 
 
@@ -1668,9 +1690,12 @@ def integrity_check(session_id: str) -> dict:
 # 受控下载票据
 #
 # 明文票据 = 32 字节 URL-safe 随机串（约 256 bit 熵），仅在签发响应中返回一次；
-# 库里只存 SHA-256(token)。凭票下载在单个 BEGIN IMMEDIATE 事务内完成
-# “存在/未撤销/未过期/剩余次数 > 0”全部校验与原子扣减，
-# 条件 UPDATE 配合行级写锁保证并发请求不可能突破次数上限。
+# 库里只存 SHA-256(token)。凭票下载持有会话锁，在单个 BEGIN IMMEDIATE 事务内
+# 完成“存在/未撤销/未过期/剩余次数 > 0/会话未隔离”全部校验、按路径预检
+# Range（416 只 stat 不打开）、并打开成品句柄固定可读对象，随后才做原子扣减；
+# 条件 UPDATE 配合行级写锁保证并发请求不可能突破次数上限。扣次与固定成品在
+# 同一把会话锁、同一事务窗口：与删除会话串行——删除先则按无成品拒绝、不扣次；
+# 下载先固定成品则扣次生效，随后删除也从句柄按声明长度送完。
 # ---------------------------------------------------------------------------
 
 
@@ -1753,14 +1778,18 @@ def create_ticket(
 
 def _claim_ticket_download(
     credential: str, raw_range: str | None
-) -> tuple[sqlite3.Row, sqlite3.Row]:
-    """在单个 IMMEDIATE 事务中校验票据、规范化 Range 并原子扣减一次。
+) -> tuple[sqlite3.Row, sqlite3.Row, object, int]:
+    """在会话锁内的单个 IMMEDIATE 事务中完成全部校验、固定成品并原子扣减一次。
 
-    返回 (票据行, 会话行)。任一校验失败都抛 HTTPException 且事务回滚，
-    绝不扣减次数。条件 UPDATE 的 rowcount 是并发上限的最终防线。
-    Range 的语法/可满足性在扣减之前按成品实际长度判定：多范围、越界等
-    416 请求与隔离（423）一样只回滚、不扣次；判定只需 stat 长度，
-    不读取文件内容。
+    返回 ``(票据行, 会话行, 已打开成品句柄, 成品长度)``，由调用方从句柄
+    流式发送并在响应结束时关闭句柄。与删除会话按同一会话锁串行：
+      * 删除先完成：票据行随会话级联消失，或成品缺失，直接拒绝、不扣次；
+      * 本流程先打开成品：句柄固定这份可读对象后才扣次并提交，随后即使
+        删除会话移走目录项，也按已声明长度从句柄送完，扣次不退回。
+    任一校验失败（票据非法/撤销/过期/耗尽、423 隔离、416 越界范围、
+    成品消失）都在扣减之前抛错回滚，绝不扣减次数，也不泄漏句柄。
+    条件 UPDATE 的 rowcount 是并发上限的最终防线。Range 预检只需 stat
+    长度，不读取文件内容；句柄打开后 Range 再由响应装配按句柄长度归一化。
     """
     ticket_id, _, token = credential.partition(".")
     if not ticket_id or not token:
@@ -1768,72 +1797,107 @@ def _claim_ticket_download(
     token_hash = hashlib.sha256(token.encode("ascii")).hexdigest()
     now_iso = storage.iso(storage.utcnow())
 
-    with db.immediate() as tx:
-        ticket = tx.execute(
-            "SELECT * FROM download_tickets WHERE id = ? AND token_hash = ?",
-            (ticket_id, token_hash),
-        ).fetchone()
-        if ticket is None:
-            raise _http(404, "ticket not found")
-        if ticket["revoked"]:
-            raise _http(403, "ticket revoked")
-        if ticket["expires_at"] <= now_iso:
-            raise _http(410, "ticket expired")
-        if ticket["remaining_downloads"] <= 0:
-            raise _http(429, "ticket download limit reached")
+    # 先在锁外解析票据归属的会话，以便按与 DELETE 相同的会话锁串行；
+    # 行是否仍然有效（撤销/过期/次数/会话状态/隔离）一律以锁内事务中的
+    # 复查为准，锁外这一查只负责定位锁。唯一无法定位的边角：票据在两次
+    # 查询之间被撤销（行仍在）——此时按不存在返回 404，撤销与 404 对客户端
+    # 同为拒绝，且撤销本就不扣次，语义无损。
+    ref = db.get_conn().execute(
+        "SELECT session_id FROM download_tickets WHERE id = ? AND token_hash = ?",
+        (ticket_id, token_hash),
+    ).fetchone()
+    if ref is None:
+        raise _http(404, "ticket not found")
+    session_id = ref["session_id"]
 
-        session = tx.execute(
-            "SELECT id, filename FROM upload_sessions "
-            "WHERE id = ? AND status = 'completed'",
-            (ticket["session_id"],),
-        ).fetchone()
-        if session is None:
-            raise _http(404, "no completed artifact for this session")
+    handle = None
+    try:
+        with session_locks.get(session_id):
+            with db.immediate() as tx:
+                ticket = tx.execute(
+                    "SELECT * FROM download_tickets WHERE id = ? AND token_hash = ?",
+                    (ticket_id, token_hash),
+                ).fetchone()
+                if ticket is None:
+                    raise _http(404, "ticket not found")
+                if ticket["revoked"]:
+                    raise _http(403, "ticket revoked")
+                if ticket["expires_at"] <= now_iso:
+                    raise _http(410, "ticket expired")
+                if ticket["remaining_downloads"] <= 0:
+                    raise _http(429, "ticket download limit reached")
 
-        # 隔离会话拒绝凭票下载：判定在扣减之前，抛错即回滚，绝不扣减次数。
-        mark = integrity.get_mark(tx, ticket["session_id"])
-        if mark is not None:
-            raise _http(
-                423,
-                "session quarantined",
-                reason=mark["reason"],
-                quarantined_at=mark["created_at"],
-            )
+                session = tx.execute(
+                    "SELECT id, filename FROM upload_sessions "
+                    "WHERE id = ? AND status = 'completed'",
+                    (ticket["session_id"],),
+                ).fetchone()
+                if session is None:
+                    raise _http(404, "no completed artifact for this session")
 
-        path = storage.artifact_path(ticket["session_id"])
-        if not path.is_file():
-            raise _http(404, "no completed artifact for this session")
+                # 隔离会话拒绝凭票下载：判定在扣减之前，抛错即回滚，绝不扣减次数。
+                mark = integrity.get_mark(tx, ticket["session_id"])
+                if mark is not None:
+                    raise _http(
+                        423,
+                        "session quarantined",
+                        reason=mark["reason"],
+                        quarantined_at=mark["created_at"],
+                    )
 
-        # Range 在扣减之前解析：多范围/越界（416）与其他拒绝一样回滚，
-        # 绝不扣减次数。这里只取长度做规范化，不打开文件读取内容。
-        ranges.parse_range_header(raw_range, path.stat().st_size)
+                path = storage.artifact_path(ticket["session_id"])
+                try:
+                    stat_size = path.stat().st_size
+                except FileNotFoundError:
+                    raise _http(404, "no completed artifact for this session")
 
-        # 原子扣减：WHERE 重放全部前置条件，两个并发请求在此串行，
-        # 后到者的 remaining_downloads 已是 0，rowcount=0 → 429，绝不超额。
-        cur = tx.execute(
-            "UPDATE download_tickets SET remaining_downloads = remaining_downloads - 1 "
-            "WHERE id = ? AND token_hash = ? AND revoked = 0 "
-            "AND expires_at > ? AND remaining_downloads > 0",
-            (ticket["id"], token_hash, now_iso),
-        )
-        if cur.rowcount != 1:
-            raise _http(429, "ticket download limit reached")
-        ticket = tx.execute(
-            "SELECT * FROM download_tickets WHERE id = ?", (ticket["id"],)
-        ).fetchone()
-    return ticket, session
+                # Range 在扣减之前按路径长度预检：多范围/越界（416）与
+                # 其他拒绝一样回滚，绝不扣减次数；此处只取长度，不读内容。
+                ranges.parse_range_header(raw_range, stat_size)
+
+                # 取得可读成品：在同一会话锁内打开句柄，删除会话无法再
+                # 把它从本请求手中夺走。打开失败（成品恰在此刻消失）同样
+                # 在扣次之前拒绝，不扣次。
+                try:
+                    handle, total_size = storage.open_artifact(ticket["session_id"])
+                except OSError as exc:
+                    raise _http(
+                        404, "no completed artifact for this session"
+                    ) from exc
+
+                # 原子扣减：WHERE 重放全部前置条件，两个并发请求在此串行，
+                # 后到者的 remaining_downloads 已是 0，rowcount=0 → 429，绝不超额。
+                cur = tx.execute(
+                    "UPDATE download_tickets SET remaining_downloads = "
+                    "remaining_downloads - 1 "
+                    "WHERE id = ? AND token_hash = ? AND revoked = 0 "
+                    "AND expires_at > ? AND remaining_downloads > 0",
+                    (ticket["id"], token_hash, now_iso),
+                )
+                if cur.rowcount != 1:
+                    raise _http(429, "ticket download limit reached")
+                ticket = tx.execute(
+                    "SELECT * FROM download_tickets WHERE id = ?", (ticket["id"],)
+                ).fetchone()
+    except BaseException:
+        # 扣次后正常路径不会走到这里（事务已提交、句柄随返回值移交）；
+        # 任何扣次前异常（含 429/416/404）都在此关闭已打开的句柄。
+        if handle is not None:
+            handle.close()
+        raise
+    return ticket, session, handle, total_size
 
 
 @app.get("/api/v1/tickets/{ticket}/download", tags=["tickets"])
 def download_with_ticket(ticket: str, request: Request) -> Response:
     raw_range = request.headers.get("range")
-    _, session = _claim_ticket_download(ticket, raw_range)
-    session_id = session["id"]
-    # 校验、Range 规范化与原子扣减已在同一事务中完成：合法 Range 按一次
-    # 计数（下载器断点续传消耗一次），范围非法（416）/隔离（423）等拒绝
-    # 在扣减前抛错，不计数。此处按已校验的 Range 流式输出对应字节。
-    return ranges.build_download_response(
-        storage.artifact_path(session_id),
+    # 会话锁内完成票据校验、隔离判定、Range 预检（416）、固定成品句柄与
+    # 原子扣减：仅在取得可读成品且 Range 有效后才扣次。此处从句柄（而非
+    # 路径）流式发送——扣次后即使会话被删除，也按声明长度送完。
+    _, session, handle, total_size = _claim_ticket_download(ticket, raw_range)
+    return ranges.build_pinned_response(
+        handle,
+        total_size,
         storage.safe_filename(session["filename"]),
         raw_range,
     )

@@ -8,7 +8,7 @@ import shutil
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import BinaryIO, Iterable, Sequence
 
 from . import settings
 
@@ -279,6 +279,27 @@ def hash_artifact_file(session_id: str) -> tuple[int, str] | None:
 def atomic_publish(tmp_file: str, session_id: str) -> None:
     """把拼装好的临时文件原子替换为成品文件。"""
     os.replace(tmp_file, artifact_path(session_id))
+
+
+def open_artifact(session_id: str) -> tuple[BinaryIO, int]:
+    """以只读方式打开已完成会话的成品，返回 ``(文件对象, 字节长度)``。
+
+    调用方必须持有该会话的会话锁，并负责在用完后关闭句柄
+    （正常送完、客户端断开、装配失败等所有路径都要关）。
+
+    打开即在目录项层面固定这一份可读成品：POSIX 下已打开文件不受随后
+    ``unlink``/``rename`` 影响——并发删除会话移走目录项后，本句柄仍指向
+    同一 inode，调用方可按取得的长度读完全部字节。长度取自已打开句柄的
+    ``fstat``，与后续读取同源、不再经过路径，因此状态码、Range 与
+    Content-Length 一旦在此确定，就与这份成品绑定，文件随后消失也成立。
+    """
+    fh = artifact_path(session_id).open("rb")
+    try:
+        size = os.fstat(fh.fileno()).st_size
+    except BaseException:
+        fh.close()
+        raise
+    return fh, size
 
 
 # ---------------------------------------------------------------------------

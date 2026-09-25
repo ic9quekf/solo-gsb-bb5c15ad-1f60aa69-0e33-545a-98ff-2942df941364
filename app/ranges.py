@@ -13,21 +13,34 @@ Range 语义、响应头与拒绝方式完全一致：
       - 后缀形式      bytes=-100         文件最后 100 字节
     闭区间起点落在文件内而结尾越界时，按 RFC 收敛到文件末尾。
   * 多范围（逗号多个区间）或无法满足的范围（如起点越过文件末尾）：
-    返回 416 Range Not Satisfiable 与 ``Content-Range: bytes */总长度``，
-    **只 stat 取长度，绝不打开/读取文件内容**。
+    返回 416 Range Not Satisfiable 与 ``Content-Range: bytes */总长度``。
 
-Range 规范化与长度判定全部在打开文件之前完成；凭票下载因此可以在
-票据扣减事务内调用，范围非法时抛错回滚、绝不扣减次数。
+并发安全（与 DELETE /sessions/{id} 的竞态）：调用方必须先持有会话锁，
+在锁内完成会话/隔离判定、按路径预检 416（只 stat 取长度、绝不打开文件
+读取内容），随后**打开成品句柄并以句柄 fstat 的长度**规范化 Range 与
+Content-Length。状态码、Range 与 Content-Length 一旦在
+:func:`build_pinned_response` 中确定，就与这份已打开的成品绑定；
+随后释放会话锁、由句柄流式发送，即使删除会话移走目录项，POSIX 已打开
+inode 依旧可读，服务端必然按声明长度送完。删除先拿到锁时，预检即按
+“无成品”语义拒绝（404/416 按总长度），不会进入句柄阶段。
+
+句柄生命周期与流式响应相同：正常送完与客户端断开都会进入生成器
+``finally``，在 shielded 区间经同一把锁（等待在途读取结束）后于工作线程
+关闭；StreamingResponse 的 ``BackgroundTask`` 再兜底关闭一次（幂等）。
 """
 from __future__ import annotations
 
+import asyncio
 import re
 from dataclasses import dataclass
-from pathlib import Path
+from typing import BinaryIO
 from urllib.parse import quote
 
+from anyio import CancelScope
+from anyio.to_thread import run_sync
 from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
+from starlette.background import BackgroundTask
 
 # 仅接受“单个” bytes 区间：多范围（值中出现逗号）一律无法满足。
 # 两种形态分开匹配，避免闭区间规则误吞后缀形式；空白在调用方先行剥除。
@@ -109,34 +122,71 @@ def _content_disposition(filename: str) -> str:
     return f"attachment; filename*=utf-8''{quote(filename)}"
 
 
-def _iter_file_segment(path: Path, start: int, end: int):
-    """流式产出 [start, end) 字节；范围解析已保证区间合法，全程不把文件读进内存。"""
+async def _stream_pinned_segment(handle: BinaryIO, start: int, end: int):
+    """从**已打开**句柄异步流式产出 [start, end) 字节，结束（含断开）必关句柄。
+
+    所有句柄操作（seek/read/close）都经同一把 :class:`anyio.Lock` 串行后
+    丢到工作线程：读期间客户端断开会取消排队等待，``finally`` 在
+    shielded 区间获取同一把锁后再关闭句柄——任何在途读取先结束、close
+    随后执行，不存在 read/close 竞争同一 fd，也不存在 fd 延迟到 GC 才释放。
+    读路径不再经过文件路径，成品随后被删除会话移走也不影响本句柄。
+    """
+    lock = asyncio.Lock()
+
+    async def read_block(length: int) -> bytes | None:
+        # 锁与 run_sync 都在 shield 内等待：取消只发生在两次读取之间的
+        # yield 点（StreamingResponse 向客户端发送块时），取消一个正在
+        # 等锁的读协程不会使锁泄漏（asyncio.Lock 对取消获取安全）。
+        with CancelScope(shield=True):
+            async with lock:
+                return await run_sync(handle.read, length)
+
+    with CancelScope(shield=True):
+        await run_sync(handle.seek, start)
+
     remaining = end - start
-    with path.open("rb") as fh:
-        fh.seek(start)
+    try:
         while remaining > 0:
-            block = fh.read(min(_CHUNK_SIZE, remaining))
+            block = await read_block(min(_CHUNK_SIZE, remaining))
             if not block:
-                # 成品在响应期间被并发截断：已发送部分无法收回，停止即可，
-                # 绝不越界读取（区间在打开文件前已按当时长度裁剪）。
-                break
+                # 已发布成品不可变，正常情况下不会发生；绝不越界读取或静默补零。
+                raise IOError("pinned artifact ended before declared Content-Length")
             yield block
             remaining -= len(block)
+    finally:
+        # 传输结束与客户端断开都到这里：shield + 同一把锁，等待在途读取
+        # （若有）完成后再关句柄；句柄在工作线程关闭，绝不阻塞事件循环。
+        with CancelScope(shield=True):
+            async with lock:
+                await run_sync(handle.close)
 
 
-def build_download_response(path: Path, filename: str, raw_range: str | None):
-    """装配会话下载/凭票下载共用的成品响应。
+def build_pinned_response(
+    handle: BinaryIO,
+    total_size: int,
+    filename: str,
+    raw_range: str | None,
+) -> StreamingResponse:
+    """从**已打开且固定**的成品句柄装配下载响应。
 
-    长度只取自 ``Path.stat()``：范围解析与 416 判定均在打开文件之前，
-    多范围/越界请求不会读取任何文件内容。
+    句柄由调用方在会话锁内打开，``total_size`` 必须是该句柄 fstat 得到的
+    长度：状态码（200/206）、Content-Range、Content-Length 全部取自这同
+    一份成品，装配完成后调用方即可释放会话锁流式发送。句柄所有权随响应
+    转移，由流式生成器在结束时（正常送完/客户端断开）关闭；本函数在发送
+    前抛错（目前仅可能是 416）时自行关闭句柄，不泄漏。
     """
-    total_size = path.stat().st_size
-    byte_range = parse_range_header(raw_range, total_size)
+    # 句柄已固定，Range 再按句柄长度归一化一次：与 Content-Length 同源，
+    # 消除“预检 stat 与句柄 fstat 之间”的任何差异窗口。
+    try:
+        byte_range = parse_range_header(raw_range, total_size)
+    except BaseException:
+        handle.close()
+        raise
     disposition = _content_disposition(filename)
 
     if byte_range is None:
         return StreamingResponse(
-            _iter_file_segment(path, 0, total_size),
+            _stream_pinned_segment(handle, 0, total_size),
             status_code=200,
             media_type="application/octet-stream",
             headers={
@@ -144,10 +194,11 @@ def build_download_response(path: Path, filename: str, raw_range: str | None):
                 "Content-Length": str(total_size),
                 "Content-Disposition": disposition,
             },
+            background=BackgroundTask(handle.close),
         )
 
     return StreamingResponse(
-        _iter_file_segment(path, byte_range.start, byte_range.end),
+        _stream_pinned_segment(handle, byte_range.start, byte_range.end),
         status_code=206,
         media_type="application/octet-stream",
         headers={
@@ -158,4 +209,5 @@ def build_download_response(path: Path, filename: str, raw_range: str | None):
             ),
             "Content-Disposition": disposition,
         },
+        background=BackgroundTask(handle.close),
     )
